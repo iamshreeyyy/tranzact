@@ -34,6 +34,7 @@ The key engineering constraint is that a durable queue prevents accepted work fr
 
 ## 2. Assumptions & Clarifying Questions
 
+
 ### Assumptions
 1. The ERP sends the **full document data in the JSON payload** (not just IDs), built from **one consistent read** with a version per document (the snapshot contract in Decision 2). If it only sends IDs, Decision 2 describes the fallback.
 2. The 1,000 single requests/min peak is **not** this one customer's load (see Section 3). I size for a short burst, not for 24/7 peak.
@@ -43,6 +44,7 @@ The key engineering constraint is that a durable queue prevents accepted work fr
 6. Compliance retention period is set by the compliance team; I use a placeholder of 8 years for cost purposes *(assumption)*.
 7. PDFs are downloaded about once each on average.
 8. Users are authenticated by the ERP; the PDF service trusts only signed requests from the ERP.
+
 
 ### Questions I would ask the product / engineering team
 1. Is the 1,000/min peak for this customer or for the whole platform? (30,000 PDFs/month is 0.69/min on average; the stated peak would consume the whole month in 30 minutes.)
@@ -60,6 +62,7 @@ The key engineering constraint is that a durable queue prevents accepted work fr
 
 ## 3. Capacity Planning & Math
 
+
 ### 3.1 Monthly workload vs peak load
 | Quantity | Calculation | Result |
 |---|---|---|
@@ -75,6 +78,7 @@ Peak-to-average ratio: 1,000 ÷ 0.69 ≈ **1,440×**. That is not plausible for 
 
 **Implication:** the monthly work is only ~17-25 render-hours (2.3-3.5% utilization of a 720 h month). Provisioning 50-100 slots 24/7 would waste ~97% of the spend. The design uses a queue, a small always-on baseline, and burst workers.
 
+
 ### 3.2 Worker capacity (preliminary estimate, not validated)
 - The assignment gives 400 MB per render but nothing about CPU per render. Chromium rendering is CPU-heavy, so **CPU, not memory, is probably the binding limit**. CPU contention makes each render slower than 2-3 s, which raises concurrency and queue depth (a feedback loop).
 - **Working hypothesis (unmeasured):** ~12 concurrent renders per 8 vCPU / 16 GB node (memory: 12 × 400 MB = 4.8 GB, so memory is not the limit at that level) and 3 slots on the 2 vCPU / 8 GB baseline node (2 single + 1 batch). Three concurrent Chromium renders on 2 vCPUs is itself doubtful (see Decision 1), so the baseline is a hypothesis too.
@@ -88,6 +92,7 @@ Peak-to-average ratio: 1,000 ÷ 0.69 ≈ **1,440×**. That is not plausible for 
 | 18 | 4 | $28.8 | $14.4 |
 
 Section 8 shows how this moves the monthly total. Renders per node is the first number I would measure.
+
 
 ### 3.3 What happens at the start of a peak (queue depth)
 - **Routing assumption (defined in Decision 1):** 5% of documents are heavy and run in the batch group. At the peak, ordinary singles are 16.7 × 95% ≈ 15.8/s (single pool) and heavy singles are 16.7 × 5% ≈ 0.83/s (batch group).
@@ -109,7 +114,8 @@ Section 8 shows how this moves the monthly total. Renders per node is the first 
 - **An accepted request is not a finished PDF.** The status API reports `ACCEPTED → RENDERING → READY` (or `FAILED`) and `ready_at`. The ERP UI must show "preparing" until `READY`, never "done".
 - **Decision gate:** do not mark the five-second requirement “met” until product clarifies whether it is a hard peak SLA. If it is hard, revise the budget or peak envelope and recalculate capacity with a load test. If the ₹12,500 cap is hard, document a lower guaranteed admission rate and explicitly label peak five-second latency as best-effort. These constraints cannot be declared simultaneously satisfied by this estimate.
 
-### 3.4 Storage, network, queue
+
+3.4 Storage, network, queue
 - **PDF storage:** 30,000 × 100 KB-1 MB = 3-30 GB/month (mid ≈ 15 GB). One year ≈ 180 GB at the midpoint.
 - **Snapshots (Decision 2):** ~20 KB average JSON × 30,000 ≈ 0.6 GB/month.
 - **Network at peak:** 16.7 PDFs/s × 0.5 MB ≈ 8.3 MB/s (≈ 67 Mbps) for singles, up to ~134 Mbps at 1 MB. Downloads go directly from S3 via presigned URLs, so they never pass through our instances.
@@ -120,7 +126,8 @@ Section 8 shows how this moves the monthly total. Renders per node is the first 
 ---
 
 
-### 3.5 Benchmark plan: prove capacity before claiming the SLA
+
+3.5 Benchmark plan: prove capacity before claiming the SLA
 
 The numbers above are a sizing hypothesis, not a capacity result. The benchmark must be run against the actual HTML templates, representative purchase orders/invoices, the chosen EC2 family, and the production container limits. Do not use a synthetic one-page PDF as the only workload.
 
@@ -155,7 +162,10 @@ The numbers above are a sizing hypothesis, not a capacity result. The benchmark 
 **Decision rule:** do not promote the 12-renders-per-node hypothesis into the capacity plan until this benchmark passes. If the five-second target is mandatory at 1,000 singles/minute, benchmark the single path against that rate while bulk load is present. If the measured warm capacity and its full monthly cost exceed the cap, record the requirements as mutually infeasible under current assumptions and request a product decision; do not quietly return 429s and call the SLA met.
 
 
-## 4. Design Decisions
+---
+
+4. Design Decisions
+
 
 ### Decision 1: Queue and worker architecture
 
@@ -269,6 +279,7 @@ Overload behaviour (when demand exceeds the node cap):
 
 ---
 
+
 ### Decision 2: Bulk data consistency (the stale invoice #87)
 
 **Alternatives considered:**
@@ -292,6 +303,7 @@ Overload behaviour (when demand exceeds the node cap):
 - Extra storage (~0.6 GB/month *(assumption)*) and a larger request payload to validate. Max payload size must be enforced (100 docs × up to 500+ rows can reach several MB).
 
 ---
+
 
 ### Decision 3: Large documents (500+ line items) and OOM
 
@@ -317,6 +329,7 @@ Overload behaviour (when demand exceeds the node cap):
 
 ---
 
+
 ### Decision 4: Reliable downloads on unreliable connections
 
 **Failure case addressed:** if a 100-PDF ZIP download disconnects at 80%, the server does not regenerate the PDFs or rebuild the ZIP. The completed ZIP remains a durable S3 object under a deterministic job key; the client resumes with HTTP Range requests against the same object (using a client that supports resume and validating the returned range/ETag). If the client or proxy cannot resume ZIP downloads, the UI offers the already-generated individual PDFs and allows the ZIP to be retried. Keep the ZIP until its configured expiry/retention policy; never use an expiring local worker file as the only copy. The API authorizes the job and issues a short-lived presigned URL; the browser downloads directly from S3, not through the render worker.
@@ -341,6 +354,7 @@ Overload behaviour (when demand exceeds the node cap):
 - Zip expiry means a customer has to re-request a bulk download after the window (the individual PDFs remain available).
 
 ---
+
 
 ### Decision 5: Tamper evidence and archival, kept simple
 
@@ -368,7 +382,7 @@ Overload behaviour (when demand exceeds the node cap):
 
 ---
 
-## 5. AI Usage Log
+5. AI Usage Log
 
 I used AI tools at different stages of the work: initial exploration, research, and then shaping and critically reviewing the proposed design. The links below are the public conversations associated with those stages.
 
@@ -386,7 +400,7 @@ I used AI tools at different stages of the work: initial exploration, research, 
 
 ---
 
-## Core failure-mode walkthrough (explicit requirement coverage)
+Core failure-mode walkthrough (explicit requirement coverage)
 
 | Problem | Mechanism | What it guarantees / limitation |
 |---|---|---|
@@ -396,7 +410,9 @@ I used AI tools at different stages of the work: initial exploration, research, 
 | Invoice 87 changes during bulk generation | Freeze all document payloads at request acceptance from one consistent ERP read; version/hash snapshots; render only snapshots | Later ERP edits do not change PDFs in the accepted bulk job. Snapshot coherence depends on the ERP implementing the stated transaction/payload contract. |
 | PDF is modified after generation | SHA-256 of exact bytes, immutable S3 object version, KMS-signed manifest, Object Lock retention; verify by recomputing digest and checking signature | Detects byte changes and prevents retained versions being overwritten/deleted under configured retention. This is tamper evidence, not proof that the original business data was correct. |
 
-## 6. Weaknesses & Future Improvements
+---
+
+6. Weaknesses & Future Improvements
 
 **Weakest parts**
 1. **Everything is sized from the assignment's numbers, not measurements.** The 400 MB per render and ~12 renders per node are assumptions. If CPU or memory per render differs, the node count and cost change.
@@ -424,7 +440,7 @@ I used AI tools at different stages of the work: initial exploration, research, 
 
 ---
 
-## 7. One Thing the Problem Statement Didn't Mention
+7. One Thing the Problem Statement Didn't Mention
 
 **Security of rendering untrusted data inside a browser.** Puppeteer renders HTML built from customer-supplied data (item descriptions, notes, names). If that data is inserted into the template unescaped, it can inject HTML or scripts, and Chromium can then load `file://` paths, call internal URLs (SSRF to the EC2 metadata service), or exfiltrate data. That would turn a PDF service into a way to read credentials or other customers' data.
 
@@ -435,7 +451,9 @@ It matters because this is the one failure that is a security incident rather th
 ---
 
 
-## Release Decision and Acceptance Gates
+---
+
+Release Decision and Acceptance Gates
 
 This is a **design proposal, not a claim of production readiness**. The implementation is eligible for launch only after these gates are met:
 
@@ -449,11 +467,14 @@ This is a **design proposal, not a claim of production readiness**. The implemen
 **Decision rule:** if the measured capacity needed to meet the hard five-second peak SLO exceeds ₹12,500/month, the requirements cannot honestly be marked as jointly satisfied under the measured assumptions. The product owner must change the budget, offered peak, or SLO. The system may still be deployed in budget-controlled mode, but it must expose backpressure explicitly and must not describe that mode as meeting the hard peak SLO.
 
 
+---
+
 ## 8. Cost Estimation
 
 *Assumptions:* ₹83 per USD (the assignment's own ratio: ₹12,500 ≈ $150). Burst usage is 20 hours/month of peak *(assumption; depends on the clarifying questions)*. Deployment model: Docker containers on EC2 with Auto Scaling groups, an **internal** ALB (the ERP is in the same VPC), no NAT Gateway.
 
 **Research references used for design constraints:** AWS documents that EC2 Auto Scaling warm pools reduce scale-out initialization latency, but they require capacity to be maintained and can add cost ([AWS warm pools](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-warm-pools.html)). AWS S3 Object Lock uses versioning and retention controls to provide WORM protection; Compliance mode prevents deletion of protected versions during retention ([AWS Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html), [configuration requirements](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-configure.html)). These official docs validate feature behaviour, not the prices in the estimate.
+
 
 ### 8.1 Line-by-line (all on-demand, conservative)
 
@@ -478,6 +499,7 @@ This is a **design proposal, not a claim of production readiness**. The implemen
 
 **Fixed vs variable split (used by 8.2 and 8.3).** Fixed costs, everything except burst nodes, are **$105.1**: baseline node $64.8, ALB $22, S3 $2, DynamoDB $1, KMS $2, CloudWatch $6, ECR $1, baseline public IPv4 $3.6, baseline EBS $2.7. Burst nodes are variable and are charged per node-hour: compute ($0.36 on-demand, $0.18 spot) + public IPv4 ($0.005) + EBS root volume (about $0.0025, assuming a 20 GB gp3 volume at ~$0.09/GB-month) = **$0.3675 per on-demand node-hour and $0.1875 per spot node-hour**. For the all-on-demand comparison in 8.1 (6 nodes × 20 h = 120 node-hours), variable burst-node charges are $44.1, which with the fixed $105.1 gives the $149.2 above. The mixed design-point scenario in 8.2 has lower variable charges. Its burst compute is $36.00 for 20 hours (not $32.40); adding the assumed $0.90 burst IPv4/EBS charges gives $36.90 variable cost and $142.00 total with the $105.10 fixed estimate.
 
+
 ### 8.2 Scenarios (this does not demonstrate that the budget fits)
 
 **Interpretation under the $40 compute guardrail:** the table compares unconstrained usage scenarios; rows whose burst-compute component exceeds $40/month are not allowed by the proposed runtime policy and would be curtailed. In particular, six all-on-demand nodes for 20 hours, eight mixed nodes for 20 hours, and six all-spot nodes for 40 hours exceed the compute guardrail even where a row’s estimated whole-bill total appears near or below ₹12,500. The guardrail is based on compute spend, while the table totals also include per-node IPv4/EBS costs.
@@ -491,24 +513,27 @@ Totals = fixed $105.1 + burst node-hours × ($0.3675 on-demand or $0.1875 spot);
 |---|---|---|---|---|
 | 6 (design point) | 20 | $149.2 ≈ ₹12,384 | $142.0 ≈ ₹11,786 | $127.6 ≈ ₹10,591 |
 | 8 (hard cap) | 20 | $163.9 ≈ ₹13,604 (over) | $149.5 ≈ ₹12,409 | $135.1 ≈ ₹11,213 |
-| 6 | 40 | $193.3 ≈ ₹16,044 (over) | $178.9 ≈ ₹14,849 (over) | $150.1 ≈ ₹12,458 |
+| 6 | 40 | $19.3 ≈ ₹16,044 (over) | $178.9 ≈ ₹14,849 (over) | $150.1 ≈ ₹12,458 |
 | 8 | 40 | $222.7 ≈ ₹18,484 (over) | $193.9 ≈ ₹16,094 (over) | $165.1 ≈ ₹13,703 (over) |
 
 **Conclusion:** the budget fit is **not yet demonstrated**. Peak hours, spot discount, renders per node, and several AWS line items are unverified. Some scenarios are arithmetically below ₹12,500, but that is not proof of an actual bill; several have very little headroom. More importantly, this burst-only cost model does not price the always-running capacity required for a hard five-second SLA at 1,000 singles/min. The rough lower bound in Section 3.3 already exceeds the budget by a large margin. Do not claim both constraints are satisfied unless the business changes the peak/SLA/budget assumptions and a verified pricing model and load test demonstrate the revised target.
 
 **What limits the bill:** the node cap does not by itself cap monthly spend (8 on-demand nodes for 20 hours already exceeds the budget). The limit is the **monthly burst-compute guardrail of $40** in Decision 1 (about 22 full-cap hours at 6 nodes, 18.5 at 8 mixed nodes, 13.9 at 8 on-demand nodes), enforced by a controller that stops scale-outs and drains nodes when thresholds are crossed. It covers burst compute only, so it is **not a cap on the whole AWS bill**, and it is a guardrail with a safety margin, not a guarantee: the AWS bill is the source of truth. Demand above either limit gets the overload behaviour (429 for singles, queueing for bulk). The product team must confirm that trade (questions 3, 4 and 9).
 
-### 8.3 Sensitivity to renders per node (72 slots, 20 peak hours, fixed costs $105.1)
+
+8.3 Sensitivity to renders per node (72 slots, 20 peak hours, fixed costs $105.1)
 | Renders per node (nodes for 72 slots) | Total, on-demand burst | Total, all-spot burst |
 |---|---|---|
-| 6 (12 nodes) | $193.3 ≈ ₹16,044 (over) | $150.1 ≈ ₹12,458 |
+| 6 (12 nodes) | $19.3 ≈ ₹16,044 (over) | $150.1 ≈ ₹12,458 |
 | 12 (6 nodes, hypothesis) | $149.2 ≈ ₹12,384 | $127.6 ≈ ₹10,591 |
 | 18 (4 nodes) | $134.5 ≈ ₹11,164 | $120.1 ≈ ₹9,968 |
+
 
 ### 8.4 What is verified and what is not
 - **Loosely cross-checked (EC2 only):** a reseller's *indicative* Mumbai guide lists t3.medium at about ₹3.4/h, so t3.large is about ₹6.8/h (≈ $0.082), and m6i.xlarge at about ₹16/h, so m6i.2xlarge is about ₹32/h and c6i.2xlarge (cheaper than m6i) should be a bit lower. My $0.09 and $0.36 are therefore slightly conservative. This is not an AWS price list.
 - **Documented rate:** to my knowledge AWS publishes public IPv4 at $0.005 per address-hour. How many addresses are billed depends on how many instances run, which 8.1-8.3 now account for per node-hour. Confirm on the AWS pricing page.
 - **Not verified:** ALB, S3 and Glacier prices (including the 128 KB minimum billable object size and transition fees), CloudWatch, KMS, EBS, the spot discount, and the exchange rate. I did not produce an AWS Pricing Calculator estimate, so the full monthly bill is unvalidated. **Check all of these in the AWS Pricing Calculator for the chosen region before submitting.**
+
 
 ### 8.5 Comparison and cost decisions
 - Always-on peak capacity: 40 workers × ₹5/h (placeholder) × 720 h = ₹1,44,000, about 11.5× the budget. The budget allows only about ₹17.4/hour for the entire service, so this is a comparison showing that always-on peak capacity cannot fit the cap.
@@ -517,10 +542,12 @@ Totals = fixed $105.1 + burst node-hours × ($0.3675 on-demand or $0.1875 spot);
 - Downloads go through S3 presigned URLs, so no proxy traffic through our instances.
 - Burst capacity runs only while queues are deep.
 
+
 ### 8.6 Other levers and risks
 - Drop the ALB and use private DNS to a single API node: saves about ₹1,800, but loses health checks.
 - **Graviton is not assumed.** Chromium/Puppeteer arm64 support must be checked first.
 - The baseline uses a burstable t3 instance. This is acceptable because average load is only 0.7 PDFs/min, but sustained peaks drain CPU credits, which is why the burst workers use non-burstable c6i.
+
 
 ### 8.7 Network paths and the no-NAT choice
 Public IPs are **not** assumed to be safer or cheaper by themselves. Option A below is a budget-driven choice with a known weakness, and the alternatives are priced.
@@ -548,6 +575,7 @@ Public IPs are **not** assumed to be safer or cheaper by themselves. Option A be
 - Least-privilege IAM per pool (workers can write only their own prefixes and claim jobs; the API cannot read archived PDFs).
 
 **Decision:** Option A for v1, with Option B or D as the upgrade if the compliance team requires private-only networking (question 10) and the budget allows.
+
 
 ### 8.8 Eight-year retention (the totals above are first-year figures)
 The S3 line in 8.1 uses a year-1 average. With the placeholder 8-year retention and the midpoint of 15 GB of new PDFs per month, the stored PDFs accumulate as follows:
